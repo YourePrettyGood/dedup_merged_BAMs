@@ -1,0 +1,12 @@
+[package]
+name = "dedup_merged_bams"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "3.1.17", features = ["derive"] }
+#fixed-vec-deque = "0.1.9"
+rust-htslib = "0.38.2"
