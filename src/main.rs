@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use rust_htslib::{bam, bam::Read, htslib};
 use std::collections::HashMap;
+use std::time;
 
 /// A tool to remove artificial duplicate alignment records from a BAM caused by merging BAMs split by region with reads overlapping the gap between regions.
 #[derive(Parser, Debug)]
@@ -23,9 +24,15 @@ struct CLIargs {
    /// Compression level of output BAM
    #[clap(short = 'l', long, default_value_t = 5u32, parse(try_from_str))]
    compression_level: u32,
+   /// Step size for emission of progress
+   #[clap(short, long, default_value_t = 1000000u64, parse(try_from_str))]
+   progress_window: u64,
+   /// Debugging verboseness flag
+   #[clap(short, long, parse(from_occurrences))]
+   debug: usize,
 }
 
-fn flush_aln_buffer(aln_buffer: &mut HashMap<(String, i32, i64, u16), bam::record::Record>, output_bam: &mut bam::Writer) {
+fn flush_aln_buffer(aln_buffer: &mut HashMap<(String, i32, i64, u16, Vec<u32>), bam::record::Record>, output_bam: &mut bam::Writer) {
    for alignment in aln_buffer.values() {
       output_bam.write(alignment).expect("Failed to write alignment to output BAM");
    }
@@ -70,8 +77,10 @@ fn main() -> Result<()> {
    const BAM_DUPFLAG: u16 = htslib::BAM_FDUP as u16;
    const BAM_DUPMASK: u16 = !BAM_DUPFLAG;
 
-   //Create the alignment buffer hash map, with a tuple of QNAME, RNAME, POS, and masked FLAGS as the key, and the record as the value:
-   let mut aln_buffer: HashMap<(String, i32, i64, u16), bam::record::Record> = HashMap::with_capacity(args.buffer_size);
+   //Create the alignment buffer hash map, with a tuple of QNAME, RNAME, POS, masked FLAGS, and CIGAR as the key, and the record as the value:
+   //Note: I've included CIGAR in the key to retain multiple supplementary alignments -- CIGARs for different supplementary alignments
+   // should be mutually exclusive due to different clipping.
+   let mut aln_buffer: HashMap<(String, i32, i64, u16, Vec<u32>), bam::record::Record> = HashMap::with_capacity(args.buffer_size);
 
    //Create a state tuple of RNAME and POS so that we clear the set upon every position change:
    //Note that the initial state doesn't actually matter.
@@ -80,6 +89,11 @@ fn main() -> Result<()> {
    //Keep track of how many records we've gone through, and how many we've dropped:
    let mut processed_records: u64 = 0u64;
    let mut dropped_records: u64 = 0u64;
+   //Progress counter:
+   let mut processed_progress: u64 = 0u64;
+
+   //Keep track of the time of processing:
+   let processing_start = time::Instant::now();
 
    //Iterate through batches of alignment records:
    for read_result in input_bam.records() {
@@ -89,14 +103,21 @@ fn main() -> Result<()> {
       //Write out the hash map contents if we've moved to the next reference base, since duplicates must have matching RNAME and POS:
       if which_base != (read.tid(), read.pos()) {
          flush_aln_buffer(&mut aln_buffer, &mut output_bam);
+         //Diagnostic output of progress on new scaffold or interval on same scaffold:
+         if which_base.0 != read.tid() || processed_records / args.progress_window > processed_progress {
+            processed_progress += 1u64;
+            eprintln!("[{:7.7}] Processing scaffold {} position {}, processed {} records, dropped {}", processing_start.elapsed().as_secs_f64(), read.tid(), read.pos(), processed_records, dropped_records);
+         }
          which_base = (read.tid(), read.pos());
       }
 
       //Annoyingly, rust_htslib::bam::Record::qname() returns a &[u8], so we need to convert to a String:
       let read_qname = std::str::from_utf8(read.qname()).context("Unable to convert read name to UTF8 string, something's weird here.")?;
+      //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
+      let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
 
       //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
-      let aln_key = (read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK);
+      let aln_key = (read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar);
 
       processed_records += 1u64;
       //Either we need to insert the read into the map if absent,
@@ -105,10 +126,23 @@ fn main() -> Result<()> {
          aln_buffer.insert(aln_key, read);
       } else {
          if read.flags() & BAM_DUPFLAG == BAM_DUPFLAG {
-            _ = aln_buffer.insert(aln_key, read);
+            if let Some(dropped_read) = aln_buffer.insert(aln_key, read) {
+               //Output the replaced record's basic info to STDERR if debugging is on:
+               if args.debug > 0usize {
+                  let dropped_read_qname = std::str::from_utf8(dropped_read.qname()).context("Unable to convert read name to UTF8 string, something's weird here.")?;
+                  eprintln!("Dropped {} at {}:{} with FLAGS {}", dropped_read_qname, dropped_read.tid(), dropped_read.pos(), dropped_read.flags());
+               }
+            }
+         //Output the current record's basic info to STDERR if debugging is on:
+         } else if args.debug > 0usize {
+            eprintln!("Dropped {} at {}:{} with FLAGS {}", read_qname, read.tid(), read.pos(), read.flags());
          }
+
          //Either the existing record got overwritten, or the current one got dropped, so either way there's a dropped record to count:
          dropped_records += 1;
+      }
+      if args.debug > 0usize && aln_buffer.len() > 20usize {
+         eprintln!("Alignment buffer with {} elements", aln_buffer.len());
       }
    }
    //Perform one last flush of the alignment buffer to account for the last position:
