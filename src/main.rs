@@ -30,9 +30,12 @@ struct CLIargs {
    /// Debugging verboseness flag
    #[clap(short, long, parse(from_occurrences))]
    debug: usize,
+   /// Buffer size to output in debugging
+   #[clap(short, long, default_value_t = 1000usize, parse(try_from_str))]
+   min_buffer_size_output: usize,
 }
 
-fn flush_aln_buffer(aln_buffer: &mut HashMap<(String, i32, i64, u16, Vec<u32>), bam::record::Record>, output_bam: &mut bam::Writer) {
+fn flush_aln_buffer(aln_buffer: &mut HashMap<(String, i32, i64, u16, Vec<u32>), std::rc::Rc<bam::record::Record>>, output_bam: &mut bam::Writer) {
    for alignment in aln_buffer.values() {
       output_bam.write(alignment).expect("Failed to write alignment to output BAM");
    }
@@ -80,7 +83,7 @@ fn main() -> Result<()> {
    //Create the alignment buffer hash map, with a tuple of QNAME, RNAME, POS, masked FLAGS, and CIGAR as the key, and the record as the value:
    //Note: I've included CIGAR in the key to retain multiple supplementary alignments -- CIGARs for different supplementary alignments
    // should be mutually exclusive due to different clipping.
-   let mut aln_buffer: HashMap<(String, i32, i64, u16, Vec<u32>), bam::record::Record> = HashMap::with_capacity(args.buffer_size);
+   let mut aln_buffer: HashMap<(String, i32, i64, u16, Vec<u32>), std::rc::Rc<bam::record::Record>> = HashMap::with_capacity(args.buffer_size);
 
    //Create a state tuple of RNAME and POS so that we clear the set upon every position change:
    //Note that the initial state doesn't actually matter.
@@ -96,7 +99,7 @@ fn main() -> Result<()> {
    let processing_start = time::Instant::now();
 
    //Iterate through batches of alignment records:
-   for read_result in input_bam.records() {
+   for read_result in input_bam.rc_records() {
       //Check if the alignment is in the buffer:
       let read = read_result.context("Unable to read alignment record")?;
 
@@ -141,7 +144,7 @@ fn main() -> Result<()> {
          //Either the existing record got overwritten, or the current one got dropped, so either way there's a dropped record to count:
          dropped_records += 1;
       }
-      if args.debug > 0usize && aln_buffer.len() > 20usize {
+      if args.debug > 0usize && aln_buffer.len() > args.min_buffer_size_output {
          eprintln!("Alignment buffer with {} elements", aln_buffer.len());
       }
    }
