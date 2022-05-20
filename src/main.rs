@@ -81,6 +81,7 @@ fn single_pass_dedup(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: 
       //Write out the hash map contents if we've moved to the next reference base, since duplicates must have matching RNAME and POS:
       if which_base != (read.tid(), read.pos()) {
          flush_aln_buffer(&mut aln_buffer, &mut output_bam);
+         aln_buffer.shrink_to(args.buffer_size);
          //Diagnostic output of progress on new scaffold or interval on same scaffold:
          if which_base.0 != read.tid() || processed_records / args.progress_window > processed_progress {
             processed_progress = processed_records / args.progress_window;
@@ -125,6 +126,7 @@ fn single_pass_dedup(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: 
    }
    //Perform one last flush of the alignment buffer to account for the last position:
    flush_aln_buffer(&mut aln_buffer, &mut output_bam);
+   aln_buffer.shrink_to(args.buffer_size);
 
    //Output the summaries to STDERR:
    eprintln!("[{:6.6}s] Done processing", processing_start.elapsed().as_secs_f64());
@@ -184,6 +186,7 @@ fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<
          aln_buffer.retain(|_, &mut v| v>>16 > 1);
          dup_map.extend(aln_buffer.iter().map(|(k,v)| (k.clone(), v.clone())));
          aln_buffer.clear();
+         aln_buffer.shrink_to(args.buffer_size);
       }
 
       //Either we need to add the read to the map if absent,
@@ -204,29 +207,6 @@ fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<
          }
       };
       aln_buffer.entry(aln_key).and_modify(update_aln_count).or_insert(1u32<<16|1u32);
-/*      if !aln_buffer.contains_key(&aln_key) {
-         //Set the lower and upper words to 1:
-         aln_buffer.insert(aln_key, 1u32<<16|1u32);
-      } else {
-         if read.flags() & BAM_DUPFLAG == BAM_DUPFLAG {
-            //The bit twiddling here is to increment the upper word, and set the lower word to the upper word's value:
-            aln_buffer.entry(aln_key).and_modify(|v| { *v += 1<<16; *v &= (1<<16)-1; *v |= *v>>16 });
-            //Output the replaced record's basic info to STDERR if debugging is on:
-            if args.debug > 0usize {
-               eprintln!("Dropped {} at {}:{} with FLAGS {}", read_qname, read.tid(), read.pos(), read.flags() & BAM_DUPMASK);
-            }
-         //Output the current record's basic info to STDERR if debugging is on:
-         } else {
-            //We don't want to set the lower word, only increment the upper word:
-            aln_buffer.entry(aln_key).and_modify(|v| { *v += 1<<16 });
-            if args.debug > 0usize {
-               eprintln!("Dropped {} at {}:{} with FLAGS {}", read_qname, read.tid(), read.pos(), read.flags());
-            }
-         }
-
-         //Either the existing record got overwritten, or the current one got dropped, so either way there's a dropped record to count:
-         dropped_records += 1;
-      }*/
       scanned_records += 1u64;
    }
    //Clear out any non-duplicates from the buffer:
@@ -234,6 +214,7 @@ fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<
    //Dump the last position's duplicates into the main dup_map:
    dup_map.extend(aln_buffer.iter().map(|(k,v)| (k.clone(), v.clone())));
    aln_buffer.clear();
+   aln_buffer.shrink_to(args.buffer_size);
    //Log the progress:
    eprintln!("[{:6.6}s] Done scanning", scanning_start.elapsed().as_secs_f64());
    (scanned_records, dropped_records, dup_map)
@@ -299,18 +280,6 @@ fn drop_dups(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: bam::Wri
             1u64
          },
       }
-      /*if let Entry::Occupied(mut elem) = dup_map.entry(aln_key) {
-         //let v: &mut u32 = elem.get_mut();
-         //We use the keep index word to count down to the alignment to output, so if it's equal to 1, output the alignment:
-         if *elem.get() & ((1<<16)-1) == 1 {
-            output_bam.write(&read).expect("Failed to write alignment to output BAM");
-            written_records += 1u64;
-         }
-         *elem.get_mut() = elem.get().saturating_sub(1);
-      } else {
-         output_bam.write(&read).expect("Failed to write alignment to output BAM");
-         written_records += 1u64;
-      }*/
    }
    eprintln!("[{:6.6}s] Done processing", drop_start.elapsed().as_secs_f64());
    written_records
