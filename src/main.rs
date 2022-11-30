@@ -40,9 +40,22 @@ struct CLIargs {
    /// Use single-pass dedup algorithm instead of two-pass
    #[clap(short, long)]
    single_pass: bool,
+   /// Exclude CIGAR string in dedup hash key?
+   #[clap(short, long)]
+   no_cigar: bool,
 }
 
-fn flush_aln_buffer(aln_buffer: &mut HashMap<(String, i32, i64, u16, Vec<u32>), std::rc::Rc<bam::record::Record>>, output_bam: &mut bam::Writer) {
+/// if args.no_cigar:
+/// (String, i32, i64, u16)
+/// else:
+/// (String, i32, i64, u16, Vec<u32>)
+#[derive(Debug, PartialEq, Eq, Hash, Clone)]
+enum ReadKey {
+   NoCIGAR(String, i32, i64, u16),
+   CIGAR(String, i32, i64, u16, Vec<u32>),
+}
+
+fn flush_aln_buffer(aln_buffer: &mut HashMap<ReadKey, std::rc::Rc<bam::record::Record>>, output_bam: &mut bam::Writer) {
    for alignment in aln_buffer.values() {
       output_bam.write(alignment).expect("Failed to write alignment to output BAM");
    }
@@ -55,10 +68,10 @@ fn single_pass_dedup(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: 
    const BAM_DUPFLAG: u16 = htslib::BAM_FDUP as u16;
    const BAM_DUPMASK: u16 = !BAM_DUPFLAG;
 
-   //Create the alignment buffer hash map, with a tuple of QNAME, RNAME, POS, masked FLAGS, and CIGAR as the key, and the record as the value:
-   //Note: I've included CIGAR in the key to retain multiple supplementary alignments -- CIGARs for different supplementary alignments
+   //Create the alignment buffer hash map, with a tuple of QNAME, RNAME, POS, masked FLAGS, and optionally CIGAR as the key, and the record as the value:
+   //Note: I've optionally included CIGAR in the key to retain multiple supplementary alignments -- CIGARs for different supplementary alignments
    // should be mutually exclusive due to different clipping.
-   let mut aln_buffer: HashMap<(String, i32, i64, u16, Vec<u32>), std::rc::Rc<bam::record::Record>> = HashMap::with_capacity(args.buffer_size);
+   let mut aln_buffer: HashMap<ReadKey, std::rc::Rc<bam::record::Record>> = HashMap::with_capacity(args.buffer_size);
 
    //Create a state tuple of RNAME and POS so that we clear the set upon every position change:
    //Note that the initial state doesn't actually matter.
@@ -92,11 +105,15 @@ fn single_pass_dedup(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: 
 
       //Annoyingly, rust_htslib::bam::Record::qname() returns a &[u8], so we need to convert to a String:
       let read_qname = std::str::from_utf8(read.qname()).expect("Unable to convert read name to UTF8 string, something's weird here.");
-      //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
-      let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
-
-      //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
-      let aln_key = (read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar);
+      let aln_key = match args.no_cigar {
+         true => ReadKey::NoCIGAR(read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK),
+         false => {
+            //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
+            let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
+            //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
+            ReadKey::CIGAR(read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar)
+         },
+      };
 
       //Either we need to insert the read into the map if absent,
       // or if present and the stored read is missing the dup flag, replace the read:
@@ -134,19 +151,19 @@ fn single_pass_dedup(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: 
    eprintln!("Dropped: {}", dropped_records);
 }
 
-fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<(String, i32, i64, u16, Vec<u32>), u32>) {
+fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<ReadKey, u32>) {
    //Set the bitflag mask so that we ignore BAM_FDUP when comparing FLAGS:
    //Note that rust-htslib defines BAM_FDUP as a u32, so we have to coerce to u16 before inverting...
    const BAM_DUPFLAG: u16 = htslib::BAM_FDUP as u16;
    const BAM_DUPMASK: u16 = !BAM_DUPFLAG;
 
-   //Create the duplicate alignment hash map, with a tuple of QNAME, RNAME, POS, masked FLAGS, and CIGAR as the key, and the record as the value:
-   //Note: I've included CIGAR in the key to retain multiple supplementary alignments -- CIGARs for different supplementary alignments
+   //Create the duplicate alignment hash map, with a tuple of QNAME, RNAME, POS, masked FLAGS, and optionally CIGAR as the key, and the record as the value:
+   //Note: I've optionally included CIGAR in the key to retain multiple supplementary alignments -- CIGARs for different supplementary alignments
    // should be mutually exclusive due to different clipping.
-   let mut dup_map: HashMap<(String, i32, i64, u16, Vec<u32>), u32> = HashMap::with_capacity(args.aln_dup_map_size);
+   let mut dup_map: HashMap<ReadKey, u32> = HashMap::with_capacity(args.aln_dup_map_size);
    //Also create a local alignment buffer hash map with the same type, but smaller capacity:
    //This will accumulate duplicates at a given site, and then be dumped into the main map.
-   let mut aln_buffer: HashMap<(String, i32, i64, u16, Vec<u32>), u32> = HashMap::with_capacity(args.buffer_size);
+   let mut aln_buffer: HashMap<ReadKey, u32> = HashMap::with_capacity(args.buffer_size);
 
    //Create a state tuple of RNAME and POS so that we clear the set upon every position change:
    //Note that the initial state doesn't actually matter.
@@ -168,11 +185,15 @@ fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<
 
       //Annoyingly, rust_htslib::bam::Record::qname() returns a &[u8], so we need to convert to a String:
       let read_qname = std::str::from_utf8(read.qname()).expect("Unable to convert read name to UTF8 string, something's weird here.");
-      //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
-      let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
-
-      //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
-      let aln_key = (read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar);
+      let aln_key = match args.no_cigar {
+         true => ReadKey::NoCIGAR(read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK),
+         false => {
+            //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
+            let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
+            //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
+            ReadKey::CIGAR(read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar)
+         },
+      };
 
       //Output progress:
       if which_base != (read.tid(), read.pos()) {
@@ -220,7 +241,7 @@ fn find_dups(args: &CLIargs, input_bam: &mut bam::Reader) -> (u64, u64, HashMap<
    (scanned_records, dropped_records, dup_map)
 }
 
-fn drop_dups(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: bam::Writer, mut dup_map: HashMap<(String, i32, i64, u16, Vec<u32>), u32>) -> u64 {
+fn drop_dups(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: bam::Writer, mut dup_map: HashMap<ReadKey, u32>) -> u64 {
    //Set the bitflag mask so that we ignore BAM_FDUP when comparing FLAGS:
    //Note that rust-htslib defines BAM_FDUP as a u32, so we have to coerce to u16 before inverting...
    const BAM_DUPFLAG: u16 = htslib::BAM_FDUP as u16;
@@ -245,11 +266,15 @@ fn drop_dups(args: CLIargs, mut input_bam: bam::Reader, mut output_bam: bam::Wri
 
       //Annoyingly, rust_htslib::bam::Record::qname() returns a &[u8], so we need to convert to a String:
       let read_qname = std::str::from_utf8(read.qname()).expect("Unable to convert read name to UTF8 string, something's weird here.");
-      //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
-      let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
-
-      //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
-      let aln_key = (read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar);
+      let aln_key = match args.no_cigar {
+         true => ReadKey::NoCIGAR(read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK),
+         false => {
+            //Also handle rust_htslib::bam::Record::raw_cigar() returning a &[u32] conversion to Vec<u32>:
+            let read_cigar: Vec<u32> = read.raw_cigar().to_owned();
+            //We mask out the DUP flag for the key so we can detect alignments that match up to that flag:
+            ReadKey::CIGAR(read_qname.to_owned(), read.tid(), read.pos(), read.flags() & BAM_DUPMASK, read_cigar)
+         },
+      };
 
       //Output progress:
       if which_base != (read.tid(), read.pos()) {
